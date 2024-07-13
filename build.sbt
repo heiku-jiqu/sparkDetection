@@ -28,7 +28,6 @@ lazy val root = (project in file(".")).
 
       "org.scalatest" %% "scalatest" % "3.2.2" % "test",
       "org.scalacheck" %% "scalacheck" % "1.15.2" % "test",
-      "com.holdenkarau" %% "spark-testing-base" % "3.5.1_1.3.0" % "test"
     ),
 
     // uses compile classpath for the run task, including "provided" jar (cf http://stackoverflow.com/a/21803413/3827)
@@ -37,7 +36,7 @@ lazy val root = (project in file(".")).
     scalacOptions ++= Seq("-deprecation", "-unchecked"),
     pomIncludeRepository := { x => false },
 
-   resolvers ++= Seq(
+    resolvers ++= Seq(
       "sonatype-releases" at "https://oss.sonatype.org/content/repositories/releases/",
       "Typesafe repository" at "https://repo.typesafe.com/typesafe/releases/",
       "Second Typesafe repo" at "https://repo.typesafe.com/typesafe/maven-releases/",
