@@ -3,6 +3,8 @@
 build.sbt_back
 .travis.yml
 
+src/test/resources/
+
 # metals lsp
 .metals/*
 metals.sbt

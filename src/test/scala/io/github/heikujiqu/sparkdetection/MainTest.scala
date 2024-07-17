@@ -160,7 +160,7 @@ class TransformTest extends AnyFunSuite {
     val location = sc.parallelize(
       Seq(Location(10, "location_name"))
     )
-    val result = VideoDetectionTransformations.run(spark, detection, location, 10).collect()
+    val result = VideoDetectionTransformations.newrun(spark, detection, location, 10).collect()
     val expected = Array(
         Output("location_name",  1,"a"),
         Output("location_name",  2,"b"),
@@ -174,6 +174,8 @@ class TransformTest extends AnyFunSuite {
         Output("location_name",  10,"j"),
     )
 
+    // expecte to have 10 items
+    assert(result.length == 10)
     // expect all the item names "a" to "j" and their corresponding counts/rank to appear
     assert(result.map(_.item_name).toSet == expected.map(_.item_name).toSet)
     // and "excluded1" and "excluded2" should not appear

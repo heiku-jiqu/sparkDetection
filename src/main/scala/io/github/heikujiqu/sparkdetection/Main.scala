@@ -8,6 +8,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.Partitioner
 import org.apache.spark.util.BoundedPriorityQueue
 import org.apache.spark.SparkConf
+import org.apache.spark.HashPartitioner
 
 object Main {
   def main(args: Array[String]): Unit = {
@@ -26,9 +27,19 @@ object Main {
     }
 
     val kryoConf = new SparkConf()
-    kryoConf.registerKryoClasses(Array(
-      classOf[Location],classOf[Detection], classOf[AggDetection], classOf[Output]
-    )).set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")// faster Serializer than JavaSerializer
+    kryoConf
+      .registerKryoClasses(
+        Array(
+          classOf[Location],
+          classOf[Detection],
+          classOf[AggDetection],
+          classOf[Output]
+        )
+      )
+      .set(
+        "spark.serializer",
+        "org.apache.spark.serializer.KryoSerializer"
+      ) // faster Serializer than JavaSerializer
 
     val spark = SparkSession
       .builder()
@@ -42,7 +53,10 @@ object Main {
         "/opt/spark/spark-events"
       ) // save eventLog for history server
       .config(kryoConf)
-      .config("spark.dynamicAllocation.enabled", true) //scales the number of executors registered with this application up and down based on the workload
+      .config(
+        "spark.dynamicAllocation.enabled",
+        true
+      ) // scales the number of executors registered with this application up and down based on the workload
       .getOrCreate()
 
     import spark.implicits._ // for type conversion
@@ -53,7 +67,7 @@ object Main {
     val locationRDD = spark.read.parquet(locationFilePath).as[Location].rdd
 
     val outputRDD =
-      VideoDetectionTransformations.run(spark, detectionRDD, locationRDD, topN)
+      VideoDetectionTransformations.newrun(spark, detectionRDD, locationRDD, topN)
 
     outputRDD.toDF().write.mode("overwrite").parquet(outputFilePath)
   }
@@ -87,6 +101,74 @@ case class Output(
 
 object VideoDetectionTransformations {
   val TOPN_DEFAULT = 10
+  def newrun(
+      spark: SparkSession,
+      detectionRDD: RDD[Detection],
+      locationRDD: RDD[Location],
+      topN: Int
+  ): RDD[Output] = {
+    // Broadcast join since RDD[Location] is small and fixed size
+    val iter = locationRDD.toLocalIterator.map { loc =>
+      (loc.geographical_location_oid, loc.geographical_location)
+    }.toSeq
+    val locationHashMap: HashMap[BigInt, String] = HashMap(iter: _*)
+    val locationHashMapBroadcast = spark.sparkContext.broadcast(locationHashMap)
+
+    // hashmap of geog_id => item_name => count
+    detectionRDD
+      .map(x =>
+        ((x.geographical_location_oid, x.item_name, x.detection_oid), 1)
+      )
+      .repartitionAndSortWithinPartitions(new CustomGeogLocPartitioner(12))
+      .mapPartitions(iter => {
+        val hm = HashMap[BigInt, HashMap[String, Int]]()
+        iter.sliding(2).foreach {
+          case List(
+                ((geog_id, item_name, detect_id), count),
+                ((geog_id2, item_name2, detect_id2), count2)
+              ) if detect_id != detect_id2 => {
+            if (!hm.contains(geog_id)) {
+              hm += (geog_id -> HashMap[String, Int]())
+            }
+            if (!hm(geog_id).contains(item_name)) {
+              hm(geog_id) += (item_name -> 0)
+            }
+            hm(geog_id)(item_name) += count
+          }
+          // account for odd number of records
+          case List(((geog_id, item_name, detect_id), count)) => {
+            if (!hm.contains(geog_id)) {
+              hm += (geog_id -> HashMap[String, Int]())
+            }
+            if (!hm(geog_id).contains(item_name)) {
+              hm(geog_id) += (item_name -> 0)
+            }
+            hm(geog_id)(item_name) += count
+          }
+          // account for duplicates, ie throw away, but still need to match
+          case duplicated => println(s"Record is duplicated: $duplicated")
+        }
+        hm.toIterator.map({
+          case (geog_id, v) => {
+            v.toArray
+              .sortBy(_._2)(Ordering[Int].reverse)
+              .take(topN)
+              .zipWithIndex
+              .map { case ((item_name, count), index) =>
+                Output(
+                  locationHashMapBroadcast.value
+                    .getOrElse(geog_id, "Location Not Found"),
+                  index + 1,
+                  item_name
+                )
+              }
+          }
+        })
+      })
+      .flatMap(a => a)
+
+  }
+
   def run(
       spark: SparkSession,
       detectionRDD: RDD[Detection],
@@ -138,30 +220,32 @@ object VideoDetectionTransformations {
   }
 
   /** Aggregation and topN for skewed dataset in one of the geographical
-    * locations. 
-    * Uses custom partitioner GeogLocSkewPartitioner to further
-    * partition the skewed location. 
-    * Uses aggregateByKey to enable partial aggregations when finding topN.
-    * Uses minheap in aggregateByKey when finding topN to minimise data needed to shuffle.
+    * locations. Uses custom partitioner GeogLocSkewPartitioner to further
+    * partition the skewed location. Uses aggregateByKey to enable partial
+    * aggregations when finding topN. Uses minheap in aggregateByKey when
+    * finding topN to minimise data needed to shuffle.
     *
-    * Below is considerations for the implementation:
-  * if big data skew, need decrease the size of partitioning for the skewed group
-  * if not a lot of data will concentrate on a node, won't make full use of cluster.
-  * The main idea is to partition the single skewed group partition into multiple smaller partitions.
-  * First, can try to increase number of partitions at the distinct() stage.
-  * Default HashPartitioning won't incur data skew at this point because distinct is using
-  * the entire row's hash.
-  * Since reduceByKey reduces locally within each partition first without the need for shuffling,
-  * having more partitions helps to reduce at partition level before doing final reduce.
-  * Second, after outputting (geog_id, item_name, count), we will need to do top 10 items in each geog_id group,
-  * if our implementation requires all items within single geog_id to be in memory,
-  * we may face data skew issues if there are massive ammount of item_names within a particular skewed geogid.
-  * In this case, we will need to partition different items within same geog_id across multiple partitions,
-  * then do aggregateByKey where it will get top 10 of each local partition first (with min heap),
-  * then combine the heaps across partitions to get overall top 10 for the geog_id.
-  * Third, if we know we are going to partition for the top 10 transformation, we can consider
-  * partitioning upfront either before the deduplication step, or even ask the datasource to partition the
-  * parquet files accordingly. This will help to reduce shuffling.
+    * Below is considerations for the implementation: if big data skew, need
+    * decrease the size of partitioning for the skewed group if not a lot of
+    * data will concentrate on a node, won't make full use of cluster. The main
+    * idea is to partition the single skewed group partition into multiple
+    * smaller partitions. First, can try to increase number of partitions at the
+    * distinct() stage. Default HashPartitioning won't incur data skew at this
+    * point because distinct is using the entire row's hash. Since reduceByKey
+    * reduces locally within each partition first without the need for
+    * shuffling, having more partitions helps to reduce at partition level
+    * before doing final reduce. Second, after outputting (geog_id, item_name,
+    * count), we will need to do top 10 items in each geog_id group, if our
+    * implementation requires all items within single geog_id to be in memory,
+    * we may face data skew issues if there are massive ammount of item_names
+    * within a particular skewed geogid. In this case, we will need to partition
+    * different items within same geog_id across multiple partitions, then do
+    * aggregateByKey where it will get top 10 of each local partition first
+    * (with min heap), then combine the heaps across partitions to get overall
+    * top 10 for the geog_id. Third, if we know we are going to partition for
+    * the top 10 transformation, we can consider partitioning upfront either
+    * before the deduplication step, or even ask the datasource to partition the
+    * parquet files accordingly. This will help to reduce shuffling.
     */
   def aggregateSkewed(
       x: RDD[Detection],
@@ -213,19 +297,21 @@ object VideoDetectionTransformations {
     val xGrouped = x.map(d => (d.geographical_location_oid, d))
     val yGrouped = y.map(d => (d.geographical_location_oid, d))
     val joined = xGrouped.join(yGrouped) // can be left outer join
-    joined.values.map({ case (agg, loc) =>
-      Output(loc.geographical_location, agg.rank, agg.item_name)
-    }).mapPartitions(x => {
-      x.toSeq.sortBy(o => (o.geographical_location, o.item_rank)).iterator
-    })
+    joined.values
+      .map({ case (agg, loc) =>
+        Output(loc.geographical_location, agg.rank, agg.item_name)
+      })
+      .mapPartitions(x => {
+        x.toSeq.sortBy(o => (o.geographical_location, o.item_rank)).iterator
+      })
   }
 
-  /** Custom joining without using `.join()` explicitly.
-   *  Implemented by converting RDD[Location] into a HashMap since
-   *  Then broadcast this hashmap to all the nodes and do lookups on this hashmap
-   *  This is possible since Location dataset is relatively small and 
-   *  doesn't grow much, so nodes won't go out of mem.
-  */
+  /** Custom joining without using `.join()` explicitly. Implemented by
+    * converting RDD[Location] into a HashMap since Then broadcast this hashmap
+    * to all the nodes and do lookups on this hashmap This is possible since
+    * Location dataset is relatively small and doesn't grow much, so nodes won't
+    * go out of mem.
+    */
   def joinManual(
       spark: SparkSession,
       x: RDD[AggDetection],
@@ -248,12 +334,14 @@ object VideoDetectionTransformations {
   }
 }
 
-/** 
- */
+/** */
 class CustomGeogLocPartitioner(totalPartitions: Int) extends Partitioner {
   def numPartitions: Int = totalPartitions
   def getPartition(key: Any): Int = key match {
     case (a: BigInt, _) =>
+      val rawMod = a.hashCode % numPartitions
+      rawMod + (if (rawMod < 0) numPartitions else 0)
+    case (a: BigInt, _, _) =>
       val rawMod = a.hashCode % numPartitions
       rawMod + (if (rawMod < 0) numPartitions else 0)
   }
