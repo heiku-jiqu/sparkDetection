@@ -1,0 +1,61 @@
+name: sparkcluster
+
+services:
+  spark-master:
+    image: spark:3.5.1
+    environment:
+      SPARK_NO_DAEMONIZE: true
+    ports:
+      - 7077:7077
+      - 8080:8080
+    command:
+      /bin/bash -c $$SPARK_HOME/sbin/start-master.sh
+    init: true # handle child processes for graceful shutdown
+    volumes:
+      - ./target/scala-2.12/:/app
+      - ./src/test/resources/:/testdata
+      - spark-logs:/opt/spark/spark-events
+    networks:
+      spark:
+    user: root
+
+  spark-worker:
+    depends_on:
+      - spark-master
+    image: spark:3.5.1
+    environment:
+      SPARK_NO_DAEMONIZE: true
+    ports:
+      - 8081:8081
+    command:
+      "/opt/spark/sbin/start-worker.sh spark://spark-master:7077"
+    init: true # handle child processes for graceful shutdown
+    volumes:
+      - ./target/scala-2.12/:/app
+      - ./src/test/resources/:/testdata
+      - spark-logs:/opt/spark/spark-events
+    networks:
+      spark:
+    user: root
+
+  spark-history-server:
+    depends_on:
+      - spark-master
+    image: spark:3.5.1
+    environment:
+      SPARK_NO_DAEMONIZE: true
+      SPARK_HISTORY_OPTS: "-Dspark.history.fs.logDirectory=/opt/spark/spark-events"
+    ports:
+      - 18080:18080
+    command:
+      /bin/bash -c $$SPARK_HOME/sbin/start-history-server.sh 
+    init: true # handle child processes for graceful shutdown
+    volumes:
+      - spark-logs:/opt/spark/spark-events
+    user: root
+
+networks:
+  spark:
+
+volumes:
+  spark-logs:
