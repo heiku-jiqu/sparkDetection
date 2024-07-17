@@ -3,7 +3,7 @@
 build.sbt_back
 .travis.yml
 
-src/test/resources/
+src/test/resources/output.parquet
 
 # metals lsp
 .metals/*
