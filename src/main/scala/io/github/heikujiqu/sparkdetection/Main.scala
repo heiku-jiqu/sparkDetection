@@ -102,6 +102,16 @@ case class Output(
 
 object VideoDetectionTransformations {
   private val TOPN_DEFAULT = 10
+
+  /** Main entrypoint to transform input RDDs into output RDD
+  *
+  *
+  * @param spark
+  * @param detectionRDD Dataset A
+  * @param locationRDD Dataset B
+  * @param topN Number of highest count item_names per geographical_location to return
+  * @return
+  */
   def run(
       spark: SparkSession,
       detectionRDD: RDD[Detection],
@@ -115,7 +125,6 @@ object VideoDetectionTransformations {
     val locationHashMap: HashMap[BigInt, String] = HashMap(iter: _*)
     val locationHashMapBroadcast = spark.sparkContext.broadcast(locationHashMap)
 
-    // 
     detectionRDD
       .map(x =>
         ((x.geographical_location_oid, x.item_name, x.detection_oid), 1)
@@ -123,11 +132,29 @@ object VideoDetectionTransformations {
       .repartitionAndSortWithinPartitions(new CustomGeogLocPartitioner(12))
       .mapPartitions(topNInPartition(_, locationHashMapBroadcast))
       .flatMap(a => a)
+
+      // To handle skewed partitions, first repartition with GeogLocSkewPartitioner
+      // do the same top N in each partition
+      // then repartition again based on just geographical_location_oid
+      // then combine the results by taking top 10 of each geographical_location_oid.
+      // Probably can use .fold to combine HashMaps.
+      //
+      // detectionRDD
+      // .map( x=>
+      //   ((x.geographical_location_oid, x.item_name, x.detection_oid), 1)
+      // )
+      // .repartitionAndSortWithinPartitions(new GeogLocSkewPartitioner(12))
+      // .mapPartitions(topNInPartition(_, locationHashMapBroadcast))
+      // .flatMap(a => a.map(output => (output.geographical_location, output)))
+      // .repartitionAndSortWithinPartitions(new CustomGeogLocPartitioner(12))
+      // .mapPartitions( x => {
+      //   x.toSeq.groupBy(_._1).valuesIterator.map( x => x.take(10).map(_._2)).flatten
+      // })
   }
 
   /** Returns count and name of top 10 items in each geographical location
-  *   Assumes partition is sorted
-  */
+    * Assumes partition is sorted
+    */
   private def topNInPartition(
       partition: Iterator[((BigInt, String, BigInt), Int)],
       locationHashMapBroadcast: Broadcast[HashMap[BigInt, String]],
@@ -182,9 +209,60 @@ object VideoDetectionTransformations {
     })
   }
 
-  /** Old transformation that involves some suffles
-  *
+/** Partition by the first field of key. Only supports Tuple2 and Tuple3.
   */
+class CustomGeogLocPartitioner(totalPartitions: Int) extends Partitioner {
+  def numPartitions: Int = totalPartitions
+  def getPartition(key: Any): Int = key match {
+    case (a: BigInt, _) =>
+      val rawMod = a.hashCode % numPartitions
+      rawMod + (if (rawMod < 0) numPartitions else 0)
+    case (a: BigInt, _, _) =>
+      val rawMod = a.hashCode % numPartitions
+      rawMod + (if (rawMod < 0) numPartitions else 0)
+    case a: String =>
+      val rawMod = a.hashCode % numPartitions
+      rawMod + (if (rawMod < 0) numPartitions else 0)
+  }
+}
+
+/** Increases the number of partitions for keys that match
+  * `skewedGeogLocationOid` by allocating this key with `skewedPartitions`
+  * number of partitions out of `totalPartitions` number of partitions.
+  */
+class GeogLocSkewPartitioner(
+    totalPartitions: Int,
+    skewedPartitions: Int = 2,
+    skewedGeogLocationOid: BigInt = 1
+) extends Partitioner {
+  require(totalPartitions > 0)
+  require(skewedPartitions > 0)
+  require(
+    totalPartitions - skewedPartitions > 0,
+    s"Number of total partitions ($totalPartitions) should be more than number of skewed partitions ($skewedPartitions)"
+  )
+
+  def numPartitions: Int = totalPartitions
+  private val numPartitionForOthers = numPartitions - 2
+  def getPartition(key: Any): Int = {
+    key match {
+      case geographical_location_oid: BigInt =>
+        if (geographical_location_oid == skewedGeogLocationOid) {
+          val rawMod = geographical_location_oid.hashCode % skewedPartitions
+          val increment = if (rawMod < 0) numPartitions else 0
+          rawMod + increment
+        } else {
+          val rawMod =
+            geographical_location_oid.hashCode % numPartitionForOthers
+          val increment = if (rawMod < 0) numPartitionForOthers else 0
+          skewedPartitions + rawMod + increment
+        }
+    }
+  }
+}
+
+  /** Old transformation that involves some suffles
+    */
   def oldrun(
       spark: SparkSession,
       detectionRDD: RDD[Detection],
@@ -350,51 +428,3 @@ object VideoDetectionTransformations {
   }
 }
 
-/** Partition by the first field of key. Only supports Tuple2 and Tuple3.
- *  
- *  */
-class CustomGeogLocPartitioner(totalPartitions: Int) extends Partitioner {
-  def numPartitions: Int = totalPartitions
-  def getPartition(key: Any): Int = key match {
-    case (a: BigInt, _) =>
-      val rawMod = a.hashCode % numPartitions
-      rawMod + (if (rawMod < 0) numPartitions else 0)
-    case (a: BigInt, _, _) =>
-      val rawMod = a.hashCode % numPartitions
-      rawMod + (if (rawMod < 0) numPartitions else 0)
-  }
-}
-
-/** Increases the number of partitions for keys that match `skewedGeogLocationOid`
- *by allocating this key with `skewedPartitions` number of partitions out of `totalPartitions` number of partitions.
- */
-class GeogLocSkewPartitioner(
-    totalPartitions: Int,
-    skewedPartitions: Int = 2,
-    skewedGeogLocationOid: BigInt = 1
-) extends Partitioner {
-  require(totalPartitions > 0)
-  require(skewedPartitions > 0)
-  require(
-    totalPartitions - skewedPartitions > 0,
-    s"Number of total partitions ($totalPartitions) should be more than number of skewed partitions ($skewedPartitions)"
-  )
-
-  def numPartitions: Int = totalPartitions
-  private val numPartitionForOthers = numPartitions - 2
-  def getPartition(key: Any): Int = {
-    key match {
-      case geographical_location_oid: BigInt =>
-        if (geographical_location_oid == skewedGeogLocationOid) {
-          val rawMod = geographical_location_oid.hashCode % skewedPartitions
-          val increment = if (rawMod < 0) numPartitions else 0
-          rawMod + increment
-        } else {
-          val rawMod =
-            geographical_location_oid.hashCode % numPartitionForOthers
-          val increment = if (rawMod < 0) numPartitionForOthers else 0
-          skewedPartitions + rawMod + increment
-        }
-    }
-  }
-}
