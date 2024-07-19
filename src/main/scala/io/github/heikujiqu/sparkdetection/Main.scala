@@ -9,6 +9,7 @@ import org.apache.spark.Partitioner
 import org.apache.spark.util.BoundedPriorityQueue
 import org.apache.spark.SparkConf
 import org.apache.spark.HashPartitioner
+import org.apache.spark.broadcast.Broadcast
 
 object Main {
   def main(args: Array[String]): Unit = {
@@ -67,7 +68,7 @@ object Main {
     val locationRDD = spark.read.parquet(locationFilePath).as[Location].rdd
 
     val outputRDD =
-      VideoDetectionTransformations.newrun(spark, detectionRDD, locationRDD, topN)
+      VideoDetectionTransformations.run(spark, detectionRDD, locationRDD, topN)
 
     outputRDD.toDF().write.mode("overwrite").parquet(outputFilePath)
   }
@@ -101,7 +102,7 @@ case class Output(
 
 object VideoDetectionTransformations {
   val TOPN_DEFAULT = 10
-  def newrun(
+  def run(
       spark: SparkSession,
       detectionRDD: RDD[Detection],
       locationRDD: RDD[Location],
@@ -120,9 +121,14 @@ object VideoDetectionTransformations {
         ((x.geographical_location_oid, x.item_name, x.detection_oid), 1)
       )
       .repartitionAndSortWithinPartitions(new CustomGeogLocPartitioner(12))
-      .mapPartitions(iter => {
+      .mapPartitions(topNInPartition(_, locationHashMapBroadcast, topN))
+      .flatMap(a => a)
+  }
+
+  private def topNInPartition(partition: Iterator[((BigInt, String, BigInt), Int)],
+    locationHashMapBroadcast: Broadcast[HashMap[BigInt, String]], topN: Int): Iterator[Array[Output]] = {
         val hm = HashMap[BigInt, HashMap[String, Int]]()
-        iter.sliding(2).foreach {
+        partition.sliding(2).foreach {
           case List(
                 ((geog_id, item_name, detect_id), count),
                 ((geog_id2, item_name2, detect_id2), count2)
@@ -164,12 +170,9 @@ object VideoDetectionTransformations {
               }
           }
         })
-      })
-      .flatMap(a => a)
-
   }
 
-  def run(
+  def oldrun(
       spark: SparkSession,
       detectionRDD: RDD[Detection],
       locationRDD: RDD[Location],

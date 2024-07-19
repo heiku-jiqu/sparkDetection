@@ -160,7 +160,7 @@ class TransformTest extends AnyFunSuite {
     val location = sc.parallelize(
       Seq(Location(10, "location_name"))
     )
-    val result = VideoDetectionTransformations.newrun(spark, detection, location, 10).collect()
+    val result = VideoDetectionTransformations.run(spark, detection, location, 10).collect()
     val expected = Array(
         Output("location_name",  1,"a"),
         Output("location_name",  2,"b"),
