@@ -101,12 +101,12 @@ case class Output(
 )
 
 object VideoDetectionTransformations {
-  val TOPN_DEFAULT = 10
+  private val TOPN_DEFAULT = 10
   def run(
       spark: SparkSession,
       detectionRDD: RDD[Detection],
       locationRDD: RDD[Location],
-      topN: Int
+      topN: Int = TOPN_DEFAULT
   ): RDD[Output] = {
     // Broadcast join since RDD[Location] is small and fixed size
     val iter = locationRDD.toLocalIterator.map { loc =>
@@ -115,63 +115,76 @@ object VideoDetectionTransformations {
     val locationHashMap: HashMap[BigInt, String] = HashMap(iter: _*)
     val locationHashMapBroadcast = spark.sparkContext.broadcast(locationHashMap)
 
-    // hashmap of geog_id => item_name => count
+    // 
     detectionRDD
       .map(x =>
         ((x.geographical_location_oid, x.item_name, x.detection_oid), 1)
       )
       .repartitionAndSortWithinPartitions(new CustomGeogLocPartitioner(12))
-      .mapPartitions(topNInPartition(_, locationHashMapBroadcast, topN))
+      .mapPartitions(topNInPartition(_, locationHashMapBroadcast))
       .flatMap(a => a)
   }
 
-  private def topNInPartition(partition: Iterator[((BigInt, String, BigInt), Int)],
-    locationHashMapBroadcast: Broadcast[HashMap[BigInt, String]], topN: Int): Iterator[Array[Output]] = {
-        val hm = HashMap[BigInt, HashMap[String, Int]]()
-        partition.sliding(2).foreach {
-          case List(
-                ((geog_id, item_name, detect_id), count),
-                ((geog_id2, item_name2, detect_id2), count2)
-              ) if detect_id != detect_id2 => {
-            if (!hm.contains(geog_id)) {
-              hm += (geog_id -> HashMap[String, Int]())
-            }
-            if (!hm(geog_id).contains(item_name)) {
-              hm(geog_id) += (item_name -> 0)
-            }
-            hm(geog_id)(item_name) += count
-          }
-          // account for odd number of records
-          case List(((geog_id, item_name, detect_id), count)) => {
-            if (!hm.contains(geog_id)) {
-              hm += (geog_id -> HashMap[String, Int]())
-            }
-            if (!hm(geog_id).contains(item_name)) {
-              hm(geog_id) += (item_name -> 0)
-            }
-            hm(geog_id)(item_name) += count
-          }
-          // account for duplicates, ie throw away, but still need to match
-          case duplicated => println(s"Record is duplicated: $duplicated")
+  /** Returns count and name of top 10 items in each geographical location
+  *   Assumes partition is sorted
+  */
+  private def topNInPartition(
+      partition: Iterator[((BigInt, String, BigInt), Int)],
+      locationHashMapBroadcast: Broadcast[HashMap[BigInt, String]],
+      topN: Int = TOPN_DEFAULT
+  ): Iterator[Array[Output]] = {
+    val hm = HashMap[BigInt, HashMap[String, Int]]()
+
+    // count each row into the HashMap
+    partition.sliding(2).foreach {
+      // when detection_id not duplicated, increment the count
+      case List(
+            ((geog_id, item_name, detect_id), count),
+            ((geog_id2, item_name2, detect_id2), count2)
+          ) if detect_id != detect_id2 => {
+        if (!hm.contains(geog_id)) {
+          hm += (geog_id -> HashMap[String, Int]())
         }
-        hm.toIterator.map({
-          case (geog_id, v) => {
-            v.toArray
-              .sortBy(_._2)(Ordering[Int].reverse)
-              .take(topN)
-              .zipWithIndex
-              .map { case ((item_name, count), index) =>
-                Output(
-                  locationHashMapBroadcast.value
-                    .getOrElse(geog_id, "Location Not Found"),
-                  index + 1,
-                  item_name
-                )
-              }
+        if (!hm(geog_id).contains(item_name)) {
+          hm(geog_id) += (item_name -> 0)
+        }
+        hm(geog_id)(item_name) += count
+      }
+      // account for odd number of records
+      case List(((geog_id, item_name, detect_id), count)) => {
+        if (!hm.contains(geog_id)) {
+          hm += (geog_id -> HashMap[String, Int]())
+        }
+        if (!hm(geog_id).contains(item_name)) {
+          hm(geog_id) += (item_name -> 0)
+        }
+        hm(geog_id)(item_name) += count
+      }
+      // account for duplicates, ie throw away, but still need to match
+      case duplicated => println(s"Record is duplicated: $duplicated")
+    }
+
+    hm.toIterator.map({
+      case (geog_id, v) => {
+        v.toArray
+          .sortBy(_._2)(Ordering[Int].reverse)
+          .take(topN)
+          .zipWithIndex
+          .map { case ((item_name, count), index) =>
+            Output(
+              locationHashMapBroadcast.value
+                .getOrElse(geog_id, "Location Not Found"),
+              index + 1,
+              item_name
+            )
           }
-        })
+      }
+    })
   }
 
+  /** Old transformation that involves some suffles
+  *
+  */
   def oldrun(
       spark: SparkSession,
       detectionRDD: RDD[Detection],
@@ -337,7 +350,9 @@ object VideoDetectionTransformations {
   }
 }
 
-/** */
+/** Partition by the first field of key. Only supports Tuple2 and Tuple3.
+ *  
+ *  */
 class CustomGeogLocPartitioner(totalPartitions: Int) extends Partitioner {
   def numPartitions: Int = totalPartitions
   def getPartition(key: Any): Int = key match {
@@ -350,31 +365,35 @@ class CustomGeogLocPartitioner(totalPartitions: Int) extends Partitioner {
   }
 }
 
-// Doubles the number of partitions for skewed geographical_location_oid
-class GeogLocSkewPartitioner(totalPartitions: Int) extends Partitioner {
+/** Increases the number of partitions for keys that match `skewedGeogLocationOid`
+ *by allocating this key with `skewedPartitions` number of partitions out of `totalPartitions` number of partitions.
+ */
+class GeogLocSkewPartitioner(
+    totalPartitions: Int,
+    skewedPartitions: Int = 2,
+    skewedGeogLocationOid: BigInt = 1
+) extends Partitioner {
+  require(totalPartitions > 0)
+  require(skewedPartitions > 0)
   require(
-    totalPartitions >= 3,
-    s"Number of partitions ($totalPartitions) should be at least 3"
+    totalPartitions - skewedPartitions > 0,
+    s"Number of total partitions ($totalPartitions) should be more than number of skewed partitions ($skewedPartitions)"
   )
 
   def numPartitions: Int = totalPartitions
-  private val numPartitionForSkewed = 2
   private val numPartitionForOthers = numPartitions - 2
-  private val skewedGeographicalLocationOid = 1
   def getPartition(key: Any): Int = {
-
     key match {
       case geographical_location_oid: BigInt =>
-        // e.g. OID of 1 is the skewed location
-        if (geographical_location_oid == skewedGeographicalLocationOid) {
-          val rawMod = geographical_location_oid.hashCode % 2
+        if (geographical_location_oid == skewedGeogLocationOid) {
+          val rawMod = geographical_location_oid.hashCode % skewedPartitions
           val increment = if (rawMod < 0) numPartitions else 0
           rawMod + increment
         } else {
           val rawMod =
             geographical_location_oid.hashCode % numPartitionForOthers
           val increment = if (rawMod < 0) numPartitionForOthers else 0
-          numPartitionForSkewed + rawMod + increment
+          skewedPartitions + rawMod + increment
         }
     }
   }
