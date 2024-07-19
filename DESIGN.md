@@ -4,9 +4,9 @@
   - Char size = 1 to 4 byte per character
   - num char = 1 to 5000 chars
 - BIGINT = uint64 = 8 byte
-- Approx event message size = ~5000bytes
-- 10_000 events per second = 50mb per sec
-- 10 * 60 * 60 * 24 = 894,000,000 events per day = 4.32 TB per day
+- Approx event message size (4 BIGINTs, 1 VARCHAR) = ~5000bytes
+- 10,000 events per second = 50mb per sec
+- 10,000 * 60 * 60 * 24 = 894,000,000 events per day = 4.32 TB per day
 - 326,310,000,000 events per year = 1631.55 TB per year
 
 From these very large estimates, the data volume and velocity is extremely high,
@@ -17,14 +17,14 @@ handling this type of scale.
 
 - What is the dashboard being used for?
 - What/when are the actions being taken after looking at the dashboard?
-  - Determines latency, query types, and availability requirements
+  - Determines latency, query types, and availability/uptime requirements
 - What are the queries that are needed to visualize the dashboard?
   - How big is the aggregation window? (if any)
   - If need aggregations/windowing, consider the trade offs between aggregation with 
     event time (IoT clocks may desync / network latency) 
     or processing time (less representative)
 - For "Realtime" latency requirements, is the realtime measured in milliseconds or minutes?
-  - If latency is not so strict (~1 minute), we can consider simplying the stack by using just Sparks' Structured Streaming
+  - If latency is not so strict (~10 minutes), we can consider simplying the stack by using just Sparks' Structured Streaming
   - Reduce the need to maintain more frameworks/systems.
   - Spark Structured Streaming can help to do streaming deduplication and write to object store/table formats like delta.
 - How much historical data is needed in the dashboard for user to make well informed decisions/actions?
@@ -39,7 +39,8 @@ handling this type of scale.
   - There is high chance there'll be peak hours for different locations, and even for different days (weekends / holidays)
   - Our system will need to account for peak traffic so it doesn't get overwhelmed at the most crucial times
 - What is the distribution of item_name length (determines how big the message/data gonna be) 
-- How many unique item_names are there (gauge whether dictionary compression will help ease size)
+- How many unique item_names and geographical_location are there 
+  (gauge whether dictionary compression will help ease size)
 - What is the interface of the data stream?
 - What is the message's serialization format? (Plain text / JSON / Protobuf / Avro / Arrow ?)
 - How late will duplication occur?
@@ -56,6 +57,22 @@ handling this type of scale.
 
 # Assumptions
 
+- Business requirements requires dashboard latency (data freshness) to be in ~1 second.
+- Queries in dashboard limited to:
+  - Top N item_names for each geographical_location for every minute
+  - Being able to have real-time query of last 24 hours' data
+  - Being able to have adhoc query on 30 days of data
+  - Assume that latency requirements are more important than "correctness" when aggregating 
+  (ie business will rather show current Top N quickly and assume that we don't need to wait for latecomers,
+  which can be updated accordingly when they arrive)
+- Assume we'll be using event time
+- Assume 10,000 events per second is the peak workload across time and day
+- Assume no growth in frequency of events over time
+- Assume we cannot preaggregating upstream (at event source level)
+- Assume the source producer can push events into our message broker
+- Assume message serialization format is Plain test / JSON for max compatability
+- Assume we can drop late events after 1 day
+  
 # Design
 ```mermaid
 flowchart LR
@@ -74,7 +91,7 @@ flowchart LR
 ```
 
 High level components:
-  - Distributed Message Broker (eg Kafka) for async processing,.
+  - Distributed Message Broker (eg Kafka) for async processing.
   - OLAP Streaming Database (eg Pinot) to satisfy stream processing + high insert throughput + low latency OLAP queries
     for our visualization platform.
   - A Data Writer (eg Spark) that does regular batch jobs (~daily) to write data to long term store.
@@ -86,8 +103,8 @@ A message broker is introduced at the start to decouple the source event produce
 from our consuming ingestion services.
 
 Some considerations for the message broker, specifically Kafka:
-  - Since this is the point of interface, the availability of this system is very important and it should have
-    better uptimes than both the producer and consumer.
+  - Since this is the point of interface between systems, the uptime of this system is very important,
+    it should have better uptimes than both the producer and consumer.
   - Retention time of Topic: 1 week ~ 1 month of retention period for our situation to balance
     replayability (in case we need to re-read the topic) and storage requirements (too many events).
   - Partitioning of the Topic: Need to have high enough partition # to account for growth and for parallelism.
@@ -95,22 +112,32 @@ Some considerations for the message broker, specifically Kafka:
   - Delivery semantics: Consider at both producer and consumer at most once to reduce latency, 
     or least once to reduce dropped messages, depending on whether dropped messages or lower latency is more important for PM.
 
+Other viable options include Cloud vendor's message brokers like 
+AWS Kinesis, Azure Service Bus, Google Pub/Sub, so that we don't have
+to manage the infrastructure.
+
 ## Streaming Database
 
 A streaming database is used to both remove duplicates and serve queries to the dashboard,
-hence this one system serves as the stream processor and the query service for the dashboard.
+hence this one system serves as the stream processor, data storage and query engine for the dashboard.
 This is intentional so that we only need to manage 1 system instead of 2 systems (Flink + Trino) and 
-also manage how the 2 systems' interaction storage layer affects the query latency.
+also alleviates us on managing how the 2 systems' interaction storage layer affects the query latency
+(eg aggregation with watermark may introduce much more latency).
 
-The streaming database will need to be able to handle high throughput insert rate, and that
-queries should be able to see the freshest data (low latency, not eventual consistency).
 
 Some considerations for the Streaming Database:
+  - The streaming database will need to be able to handle high throughput insert rate, and that
+    queries should be able to see the freshest data (low latency, not eventual consistency).
   - Need to decide on retention period for the realtime storage: Pinot is able to have a "hybrid" table 
     where it is fusion of realtime table (for fast updates) and "offline" table (for more historical data)
   - Since we are deduplicating, we will need to size the nodes' memory to handle the deduplication:
     based on our workload (~7 billion events per day * 8bytes for detection ID / # of partitions worth of data inmem). 
     Assume is just duplicated data, not updates to fields, so only need to hash the key.
+
+Other options considered are Clickhouse and Materialize, however these do not seem
+to be able to scale enough to handle the current combination of data volume and low latency requirements.
+(Clickhouse can be distributed, but the distributed nodes are eventually consistent. 
+Materialize only have full replicas, so only can scale to the biggest single node, plus its not as established.)
 
 ### Adding a Stream Processor
 
@@ -126,6 +153,12 @@ the data events.
 This can help with future data re-reprocessing should there be new use cases / updated calculations that need 
 to be done on all historical data. 
 In addition, this also helps keep the Message Broker lean as it doesn't have to store the entire history.
+
+## Reconciliation Service
+
+There might be times where reconciliation is needed for the Streaming DB due to dropped events / late events etc.
+If needed, we will need to reconciliate the historical data from our Object Store so that
+historical data in the Streaming DB is more accurate.
 
 # Taking a step back
 
