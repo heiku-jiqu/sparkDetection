@@ -1,13 +1,9 @@
 # Dependencies
 
 - `sbt`
+- `AdoptJDK 1.11.0`
 
 # Bootstrapping Project
-
-## Setup Project Directory
-
-`sbt new holdenk/sparkProjectTemplate.g8`
-
 
 # Developing
 
@@ -34,7 +30,6 @@ Then run `spark-submit`.
 
 ```bash
 /opt/spark/bin/spark-submit --class io.github.heikujiqu.sparkDetection.Main --master spark://sparkcluster-spark-master-1:7077 /app/sparkDetection-assembly-0.0.1.jar
-
 ```
 
-`master` hostname in `spark://master` is aliased with the docker compose service's name.
+On host computer, spark history server is also exposed at `localhost:18080`, so that you can see past jobs.
