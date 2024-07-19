@@ -3,8 +3,6 @@
 - `sbt`
 - `AdoptJDK 1.11.0`
 
-# Bootstrapping Project
-
 # Developing
 
 ## Unit Testing
